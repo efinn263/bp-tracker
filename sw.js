@@ -5,13 +5,13 @@ self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE).then(c => c.addAll([
       base,
-      base + 'css/app.css',
-      base + 'js/db.js',
-      base + 'js/import.js',
-      base + 'js/app.js',
+      base + 'app.css',
+      base + 'db.js',
+      base + 'import.js',
+      base + 'app.js',
       base + 'manifest.json',
-      base + 'icons/icon-192.png',
-      base + 'icons/icon-512.png',
+      base + 'icon-192.png',
+      base + 'icon-512.png',
     ]).catch(() => {})).then(() => self.skipWaiting())
   );
 });
