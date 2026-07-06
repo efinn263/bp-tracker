@@ -63,3 +63,4 @@ Pressure XS Pro,bpm,67,2026-06-22 06:34:00Z
 ```
 
 Wide format (Systolic/Diastolic/BPM columns) is also supported.
+
