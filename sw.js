@@ -1,4 +1,4 @@
-const CACHE = 'bp-tracker-v1';
+const CACHE = 'bp-tracker-v2';
 
 self.addEventListener('install', e => {
   const base = self.registration.scope;
