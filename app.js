@@ -12,7 +12,7 @@ const MedLinesPlugin = {
     ctx.save();
     ctx.lineWidth = 1.5;
     ctx.setLineDash([5, 5]);
-    ctx.strokeStyle = 'rgba(250, 204, 21, 0.65)';
+    ctx.strokeStyle = 'rgba(180, 120, 4, 0.75)';
     for (const ts of opts.timestamps) {
       const px = x.getPixelForValue(ts);
       if (px < left || px > right) continue;
@@ -25,33 +25,100 @@ const MedLinesPlugin = {
   }
 };
 
-/* Plugin 2: Auto-dismiss tooltip after 3 seconds */
-const TooltipDismissPlugin = {
-  id: 'tooltipDismiss',
-  afterEvent(chart, args) {
-    const { type } = args.event;
-    if (['mousemove','touchstart','touchmove','click'].includes(type)) {
-      clearTimeout(chart._ttTimer);
-      if (chart.tooltip?.getActiveElements()?.length > 0) {
-        chart._ttTimer = setTimeout(() => {
-          chart.tooltip.setActiveElements([], { x:0, y:0 });
-          chart.update('none');
-        }, 3000);
+/* Plugin 2: Tooltip only appears on a single-finger tap (or click) — pinch-zoom
+   never triggers it — and fades away automatically after 2 seconds. */
+const TapTooltipPlugin = {
+  id: 'tapTooltip',
+  afterInit(chart) {
+    const canvas = chart.canvas;
+    const hide = () => {
+      clearTimeout(chart._tapTtTimer);
+      if (chart.tooltip?.getActiveElements()?.length) {
+        chart.tooltip.setActiveElements([], { x:0, y:0 });
+        chart.update('none');
+      }
+    };
+    const show = nativeEvent => {
+      const points = chart.getElementsAtEventForMode(nativeEvent, 'index', { intersect:false }, true);
+      if (!points.length) return;
+      chart.tooltip.setActiveElements(points, { x:0, y:0 });
+      chart.update('none');
+      clearTimeout(chart._tapTtTimer);
+      chart._tapTtTimer = setTimeout(hide, 2000);
+    };
+    const onTouchStart = e => { if (e.touches.length !== 1) hide(); else show(e); };
+    const onClick = e => show(e);
+    canvas.addEventListener('touchstart', onTouchStart, { passive:true });
+    canvas.addEventListener('click', onClick);
+    chart._tapTooltipCleanup = () => {
+      clearTimeout(chart._tapTtTimer);
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('click', onClick);
+    };
+  },
+  beforeDestroy(chart){ chart._tapTooltipCleanup?.(); }
+};
+
+/* Plugin 3: Animated baseline vs post-dose average reference lines
+   ("baseline reduction" infographic) — one horizontal line per data
+   population, wiping in left-to-right with a fade-in label. */
+const BaselineShiftPlugin = {
+  id: 'baselineShift',
+  afterDraw(chart) {
+    const opts = chart.options.plugins?.baselineShift;
+    if (!opts?.lines?.length) return;
+    const { ctx, chartArea: { left, right, top, bottom }, scales: { y } } = chart;
+    const progress = chart._bsProgress ?? 1;
+    ctx.save();
+    ctx.font = '700 10px system-ui,sans-serif';
+    for (const line of opts.lines) {
+      if (line.value == null) continue;
+      const py = y.getPixelForValue(line.value);
+      if (py < top || py > bottom) continue;
+      const endX = left + (right - left) * progress;
+      ctx.beginPath();
+      ctx.setLineDash(line.dash);
+      ctx.strokeStyle = line.color;
+      ctx.lineWidth = 1.5;
+      ctx.moveTo(left, py);
+      ctx.lineTo(endX, py);
+      ctx.stroke();
+      if (progress > 0.85) {
+        ctx.setLineDash([]);
+        ctx.globalAlpha = Math.min(1, (progress - 0.85) / 0.15);
+        ctx.fillStyle = line.color;
+        ctx.textAlign = 'right';
+        ctx.fillText(line.label, right - 3, py - 4);
+        ctx.globalAlpha = 1;
       }
     }
+    ctx.restore();
   }
 };
 
-Chart.register(MedLinesPlugin, TooltipDismissPlugin);
+function animateBaselineShift(chart){
+  const start = performance.now(), dur = 700;
+  function step(now){
+    if (!chart.ctx) return; // destroyed mid-animation
+    const t = Math.min(1, (now - start) / dur);
+    chart._bsProgress = 1 - Math.pow(1 - t, 3);
+    chart.update('none');
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+Chart.register(MedLinesPlugin, TapTooltipPlugin, BaselineShiftPlugin);
 
 /* ═══ App ═══ */
 const App = (() => {
 
   const S = {
     view: 'dashboard',
-    range: '30d',
+    range: '8h',
     chart: null,
     showBpm: true,
+    reductionUnit: 'pct',
   };
 
   /* ── Utilities ── */
@@ -69,10 +136,11 @@ const App = (() => {
     return d.toISOString().slice(0,16);
   }
   function getRangeTs(){
-    const now=Date.now(), map={'7d':7,'14d':14,'30d':30,'90d':90};
+    const now=Date.now(), map={'7d':7,'14d':14,'30d':30};
     if(S.range==='all')    return {start:null,end:null};
     if(S.range==='custom') return {start:S.customStart?new Date(S.customStart).getTime():null, end:S.customEnd?new Date(S.customEnd).getTime():now};
-    return {start:now-(map[S.range]||30)*86400000, end:now};
+    if(S.range==='8h')     return {start:now-8*3600000, end:now};
+    return {start:now-(map[S.range]||7)*86400000, end:now};
   }
   function toast(msg,type=''){
     const c=document.getElementById('toasts');
@@ -114,6 +182,50 @@ const App = (() => {
       .slice(0,3);
   }
 
+  /* ── Peak reduction: biggest single-reading drop from baseline avg, with elapsed time ── */
+  function peakReduction(baselineAvg, afterReadings, key, doseTs){
+    if(baselineAvg==null) return null;
+    let best=null;
+    for(const r of afterReadings){
+      const v=r[key];
+      if(v==null) continue;
+      if(best==null || v<best.v) best={v,ts:r.timestamp};
+    }
+    if(!best) return null;
+    const mmhg=round(baselineAvg-best.v,1);
+    const pct=round(mmhg/baselineAvg*100,1);
+    const hours=round((best.ts-doseTs)/3600000,1);
+    return {mmhg,pct,hours};
+  }
+
+  /* ── Shared reduction badge / peak-line renderers (used by Meds list + graph modal) ── */
+  function rbadge(pct,mmhg,lbl){
+    const val = S.reductionUnit==='mmhg'?mmhg:pct;
+    if(val==null) return '';
+    const cls=val>0?'pos':val<0?'neg':'neu';
+    const unit=S.reductionUnit==='mmhg'?'mmHg':'%';
+    return `<span class="reduction ${cls}">${lbl} ${val>0?'↓':'↑'}${Math.abs(val)}${unit}</span>`;
+  }
+  function peakLine(peak,lbl){
+    if(!peak) return '';
+    const val = S.reductionUnit==='mmhg' ? `${Math.abs(peak.mmhg)} mmHg` : `${Math.abs(peak.pct)}%`;
+    const dir = peak.mmhg>0?'reduction':peak.mmhg<0?'increase':'change';
+    const hrs = Math.abs(peak.hours);
+    return `<div class="peak-line">${lbl}: <strong>${val} peak ${dir}</strong> in ${hrs} hour${hrs!==1?'s':''}</div>`;
+  }
+  function unitToggle(id){
+    return `<div class="unit-toggle" id="${id}">
+      <button class="ut-btn${S.reductionUnit==='pct'?' active':''}" data-unit="pct">%</button>
+      <button class="ut-btn${S.reductionUnit==='mmhg'?' active':''}" data-unit="mmhg">mmHg</button>
+    </div>`;
+  }
+  function bindUnitToggle(id,onChange){
+    document.getElementById(id)?.addEventListener('click',e=>{
+      const b=e.target.closest('[data-unit]'); if(!b) return;
+      S.reductionUnit=b.dataset.unit; onChange();
+    });
+  }
+
   /* ═══════════════════════════
      DASHBOARD
   ═══════════════════════════ */
@@ -126,17 +238,17 @@ const App = (() => {
     const avgSys=round(avg(readings,'systolic'));
     const avgDia=round(avg(readings,'diastolic'));
     const avgBpm=round(avg(readings,'bpm'));
-    const rlbl={'7d':'7D','14d':'14D','30d':'30D','90d':'90D','all':'All'};
+    const rlbl={'8h':'8H','7d':'7D','14d':'14D','30d':'30D','all':'All'};
 
     main.innerHTML=`
       <div class="range-tabs" id="range-tabs">
-        ${['7d','14d','30d','90d','all'].map(r=>`<button class="rtab${S.range===r?' active':''}" data-range="${r}">${rlbl[r]}</button>`).join('')}
+        ${['8h','7d','14d','30d','all'].map(r=>`<button class="rtab${S.range===r?' active':''}" data-range="${r}">${rlbl[r]}</button>`).join('')}
       </div>
       <div class="sec">
         <div class="card">
           <div class="chart-wrap"><canvas id="chart"></canvas></div>
           <div class="chart-controls">
-            <span class="chart-hint">Pinch or scroll to zoom · Drag to pan</span>
+            <span class="chart-hint">Tap a point for details · Pinch or scroll to zoom · Drag to pan</span>
             <label class="bpm-toggle">
               <input type="checkbox" id="bpm-cb" ${S.showBpm?'checked':''}> BPM
             </label>
@@ -263,6 +375,7 @@ const App = (() => {
       options:{
         responsive:true, maintainAspectRatio:false,
         interaction:{mode:'index',intersect:false},
+        events:[],
         scales:{
           x:{
             type:'time',
@@ -469,19 +582,20 @@ const App = (() => {
       const pSys=round(avg(after,'systolic'),1),    pDia=round(avg(after,'diastolic'),1);
       const sysRed=(bSys!=null&&pSys!=null)?round((bSys-pSys)/bSys*100,1):null;
       const diaRed=(bDia!=null&&pDia!=null)?round((bDia-pDia)/bDia*100,1):null;
-      return {...ev,bSys,bDia,pSys,pDia,sysRed,diaRed,bCount:baseline.length,pCount:after.length};
+      const sysMmhg=(bSys!=null&&pSys!=null)?round(bSys-pSys,1):null;
+      const diaMmhg=(bDia!=null&&pDia!=null)?round(bDia-pDia,1):null;
+      const sysPeak=peakReduction(bSys,after,'systolic',ev.timestamp);
+      const diaPeak=peakReduction(bDia,after,'diastolic',ev.timestamp);
+      return {...ev,bSys,bDia,pSys,pDia,sysRed,diaRed,sysMmhg,diaMmhg,sysPeak,diaPeak,bCount:baseline.length,pCount:after.length};
     });
-
-    function rbadge(val,lbl){
-      if(val==null) return '';
-      const cls=val>0?'pos':val<0?'neg':'neu';
-      return `<span class="reduction ${cls}">${lbl} ${val>0?'↓':'↑'}${Math.abs(val)}%</span>`;
-    }
 
     main.innerHTML=`
       <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 16px 2px">
         <div style="font-size:22px;font-weight:800;letter-spacing:-.5px">Medications</div>
-        <button class="btn btn-secondary btn-sm" id="toggle-mf">+ Log Dose</button>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${unitToggle('unit-toggle')}
+          <button class="btn btn-secondary btn-sm" id="toggle-mf">+ Log Dose</button>
+        </div>
       </div>
       <div class="vsub">Tap any event to see the BP response graph</div>
 
@@ -545,9 +659,10 @@ const App = (() => {
             </div>
             <div class="med-reductions">
               ${ev.sysRed!=null||ev.diaRed!=null
-                ? rbadge(ev.sysRed,'Sys')+rbadge(ev.diaRed,'Dia')
+                ? rbadge(ev.sysRed,ev.sysMmhg,'Sys')+rbadge(ev.diaRed,ev.diaMmhg,'Dia')
                 : '<span class="reduction neu">No readings in windows</span>'}
             </div>
+            ${ev.sysPeak||ev.diaPeak?`<div class="peak-lines">${peakLine(ev.sysPeak,'Sys')}${peakLine(ev.diaPeak,'Dia')}</div>`:''}
             ${ev.notes?`<div style="margin-top:6px;font-size:12px;color:var(--text-2)">${esc(ev.notes)}</div>`:''}
           </div>`).join('')}
           </div>`:
@@ -557,6 +672,7 @@ const App = (() => {
       </div>
     `;
 
+    bindUnitToggle('unit-toggle',()=>renderMeds(main));
     document.getElementById('toggle-mf').addEventListener('click',()=>{
       const sec=document.getElementById('mf-sec');
       const open=sec.style.display!=='none';
@@ -611,6 +727,22 @@ const App = (() => {
     const pSys=round(avg(after,'systolic'),1),    pDia=round(avg(after,'diastolic'),1);
     const sysRed=(bSys!=null&&pSys!=null)?round((bSys-pSys)/bSys*100,1):null;
     const diaRed=(bDia!=null&&pDia!=null)?round((bDia-pDia)/bDia*100,1):null;
+    const sysMmhg=(bSys!=null&&pSys!=null)?round(bSys-pSys,1):null;
+    const diaMmhg=(bDia!=null&&pDia!=null)?round(bDia-pDia,1):null;
+    const sysPeak=peakReduction(bSys,after,'systolic',ts);
+    const diaPeak=peakReduction(bDia,after,'diastolic',ts);
+
+    function reductionHTML(){
+      return `
+        <div style="padding:0 16px;display:flex;justify-content:flex-end">${unitToggle('mg-unit-toggle')}</div>
+        <div style="padding:6px 16px 0;display:flex;gap:8px;flex-wrap:wrap">
+          ${sysRed!=null||diaRed!=null
+            ? rbadge(sysRed,sysMmhg,'Sys')+rbadge(diaRed,diaMmhg,'Dia')
+            : '<span class="reduction neu">Not enough readings to calculate reduction</span>'}
+        </div>
+        ${sysPeak||diaPeak?`<div class="peak-lines" style="padding:8px 16px 18px">${peakLine(sysPeak,'Sys')}${peakLine(diaPeak,'Dia')}</div>`:'<div style="height:12px"></div>'}
+      `;
+    }
 
     const modal=document.createElement('div');
     modal.className='modal-overlay';
@@ -620,7 +752,7 @@ const App = (() => {
           <span>${esc(ev.medication)}${ev.dose?' '+esc(ev.dose):''}</span>
           <button class="modal-close" id="mg-close">Close</button>
         </div>
-        <div style="padding:10px 16px 0;font-size:11px;color:var(--text-3)">${fmtDT(ts)} · dashed line = dose time</div>
+        <div style="padding:10px 16px 0;font-size:11px;color:var(--text-3)">${fmtDT(ts)} · dashed vertical line = dose time · dashed horizontal lines = baseline/post-dose averages</div>
         <div style="padding:8px 16px 0"><div style="height:220px;position:relative"><canvas id="med-chart"></canvas></div></div>
         <div style="padding:10px 16px 4px;display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div class="stat-chip">
@@ -636,14 +768,18 @@ const App = (() => {
             </div>
           </div>
         </div>
-        <div style="padding:0 16px 18px;display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-          ${sysRed!=null?`<span class="reduction ${sysRed>0?'pos':sysRed<0?'neg':'neu'}">Sys ${sysRed>0?'↓':'↑'}${Math.abs(sysRed)}%</span>`:''}
-          ${diaRed!=null?`<span class="reduction ${diaRed>0?'pos':diaRed<0?'neg':'neu'}">Dia ${diaRed>0?'↓':'↑'}${Math.abs(diaRed)}%</span>`:''}
-          ${sysRed==null&&diaRed==null?`<span class="reduction neu">Not enough readings to calculate reduction</span>`:''}
-        </div>
+        <div id="mg-reduction">${reductionHTML()}</div>
       </div>
     `;
     document.body.appendChild(modal);
+
+    function bindReductionToggle(){
+      bindUnitToggle('mg-unit-toggle',()=>{
+        document.getElementById('mg-reduction').innerHTML=reductionHTML();
+        bindReductionToggle();
+      });
+    }
+    bindReductionToggle();
 
     let medChart=null;
     setTimeout(()=>{
@@ -658,6 +794,7 @@ const App = (() => {
         options:{
           responsive:true, maintainAspectRatio:false,
           interaction:{mode:'index',intersect:false},
+          events:[],
           scales:{
             x:{type:'time', time:{displayFormats:{minute:'HH:mm',hour:'MMM d HH:mm'}},
               min:wStart, max:wEnd,
@@ -670,11 +807,20 @@ const App = (() => {
           plugins:{
             legend:{display:false},
             medLines:{timestamps:[ts]},
+            baselineShift:{lines:[]},
             tooltip:{backgroundColor:'#1a1916',titleFont:{size:11},bodyFont:{size:12},padding:10,cornerRadius:8},
             zoom:{zoom:{wheel:{enabled:false},pinch:{enabled:false}},pan:{enabled:false}},
           },
         },
       });
+      medChart._bsProgress=0;
+      medChart.options.plugins.baselineShift.lines=[
+        {value:bSys, color:'rgba(192,82,82,.5)',  dash:[3,3], label:'Baseline'},
+        {value:pSys, color:'rgba(192,82,82,.95)', dash:[8,3], label:'Post-dose'},
+        {value:bDia, color:'rgba(59,123,191,.5)', dash:[3,3], label:'Baseline'},
+        {value:pDia, color:'rgba(59,123,191,.95)',dash:[8,3], label:'Post-dose'},
+      ];
+      animateBaselineShift(medChart);
     }, 50);
 
     const close=()=>{medChart?.destroy(); modal.remove();};
@@ -705,6 +851,7 @@ const App = (() => {
             <p><strong style="color:var(--text-1)">Long format (Pressure XS Pro):</strong> Device, Metric, Value, Time columns — imported directly, no changes needed.</p>
             <p style="margin-top:8px"><strong style="color:var(--text-1)">Wide format:</strong> Systolic, Diastolic, BPM, Time columns per row.</p>
             <p style="margin-top:8px"><strong style="color:var(--text-1)">JSON backup:</strong> Previously exported from this app (includes meds &amp; notes).</p>
+            <p style="margin-top:8px">Column/metric names are matched flexibly — "sys", "sis", "systolic", "SBP" etc. all work, as do most date formats (24-hour, long day names, and stray trailing "Z" letters are handled automatically). Duplicate entries are skipped automatically.</p>
           </div>
         </div>
       </div>
@@ -722,13 +869,14 @@ const App = (() => {
       try{
         const type=Importer.getType(file);
         if(!type){toast('Unsupported file type','err');preview.innerHTML='';return;}
-        let importData,readings=[],isBackup=false;
+        let importData,readings=[],isBackup=false,fileDupes=0;
         if(type==='json'){
           importData=await Importer.fromJSON(file);
           if(importData?.version&&Array.isArray(importData.readings)){isBackup=true;readings=importData.readings;}
           else readings=Array.isArray(importData)?importData:[];
         } else {
-          readings=type==='csv'?await Importer.fromCSV(file):await Importer.fromXLSX(file);
+          const result=type==='csv'?await Importer.fromCSV(file):await Importer.fromXLSX(file);
+          readings=result.readings; fileDupes=result.duplicatesSkipped;
           importData={readings};
         }
         if(!readings.length){toast('No valid readings found','err');preview.innerHTML='';return;}
@@ -736,6 +884,7 @@ const App = (() => {
         preview.innerHTML=`<div class="card"><div class="card-body">
           <div style="font-size:15px;font-weight:700;margin-bottom:10px">Found <span style="color:var(--accent)">${n} reading${n!==1?'s':''}</span>
           ${isBackup&&importData.medEvents?.length?` + ${importData.medEvents.length} med event${importData.medEvents.length!==1?'s':''}`:''}</div>
+          ${fileDupes?`<div style="font-size:12px;color:var(--text-3);margin:-6px 0 10px">${fileDupes} duplicate${fileDupes!==1?'s':''} within the file were ignored</div>`:''}
           ${readings.slice(0,3).map(r=>`<div class="import-row">
             ${new Date(r.timestamp).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})} —
             <span style="color:var(--sys)">${r.systolic??'—'}</span>/<span style="color:var(--dia)">${r.diastolic??'—'}</span> mmHg
@@ -748,10 +897,17 @@ const App = (() => {
           </div>
         </div></div>`;
         document.getElementById('do-replace').addEventListener('click',async()=>{
-          await DB.importAll(importData,false); toast(`Imported ${n} readings`,'ok'); preview.innerHTML=''; setView('dashboard');
+          await DB.importAll(importData,false);
+          toast(`Imported ${n} reading${n!==1?'s':''}${fileDupes?` (${fileDupes} duplicate${fileDupes!==1?'s':''} ignored)`:''}`,'ok');
+          preview.innerHTML=''; setView('dashboard');
         });
         document.getElementById('do-merge').addEventListener('click',async()=>{
-          await DB.importAll(importData,true); toast(`Merged ${n} readings`,'ok'); preview.innerHTML=''; setView('dashboard');
+          const existing=await DB.getReadings();
+          const {readings:toAdd,duplicatesSkipped:mergeDupes}=Importer.dedupeAgainst(readings,existing);
+          const totalDupes=fileDupes+mergeDupes;
+          await DB.importAll({...importData,readings:toAdd},true);
+          toast(`Merged ${toAdd.length} reading${toAdd.length!==1?'s':''}${totalDupes?` (${totalDupes} duplicate${totalDupes!==1?'s':''} ignored)`:''}`,'ok');
+          preview.innerHTML=''; setView('dashboard');
         });
       } catch(err){console.error(err);toast('Error reading file','err');preview.innerHTML='';}
     }
