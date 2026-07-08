@@ -25,12 +25,17 @@ const MedLinesPlugin = {
   }
 };
 
-/* Plugin 2: Tooltip only appears on a single-finger tap (or click) — pinch-zoom
-   never triggers it — and fades away automatically after 2 seconds. */
+/* Plugin 2: Tooltip only appears on a momentary single-finger tap (or click) —
+   a swipe/drag (used for panning) never triggers it — and fades away
+   automatically after 2 seconds. */
 const TapTooltipPlugin = {
   id: 'tapTooltip',
   afterInit(chart) {
     const canvas = chart.canvas;
+    const TAP_MOVE_PX = 10;
+    const TAP_MAX_MS  = 500;
+    let start = null; // {x, y, t, event}
+    let moved = false;
     const hide = () => {
       clearTimeout(chart._tapTtTimer);
       if (chart.tooltip?.getActiveElements()?.length) {
@@ -46,13 +51,34 @@ const TapTooltipPlugin = {
       clearTimeout(chart._tapTtTimer);
       chart._tapTtTimer = setTimeout(hide, 2000);
     };
-    const onTouchStart = e => { if (e.touches.length !== 1) hide(); else show(e); };
+    const onTouchStart = e => {
+      if (e.touches.length !== 1) { start = null; hide(); return; }
+      const t = e.touches[0];
+      start = { x:t.clientX, y:t.clientY, t:Date.now(), event:e };
+      moved = false;
+    };
+    const onTouchMove = e => {
+      if (!start || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX-start.x, t.clientY-start.y) > TAP_MOVE_PX) {
+        if (!moved) hide(); // swipe/pan started — cancel the tap and dismiss any tooltip
+        moved = true;
+      }
+    };
+    const onTouchEnd = () => {
+      if (start && !moved && (Date.now()-start.t) <= TAP_MAX_MS) show(start.event);
+      start = null; moved = false;
+    };
     const onClick = e => show(e);
     canvas.addEventListener('touchstart', onTouchStart, { passive:true });
+    canvas.addEventListener('touchmove', onTouchMove, { passive:true });
+    canvas.addEventListener('touchend', onTouchEnd, { passive:true });
     canvas.addEventListener('click', onClick);
     chart._tapTooltipCleanup = () => {
       clearTimeout(chart._tapTtTimer);
       canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
       canvas.removeEventListener('click', onClick);
     };
   },
@@ -846,6 +872,12 @@ const App = (() => {
       </div>
       <div id="import-preview" class="sec" style="padding-top:0"></div>
       <div class="sec" style="padding-top:0">
+        <div class="card">
+          <div class="card-hdr">Sync from Device</div>
+          <div class="card-body" id="oxiline-sync-body"></div>
+        </div>
+      </div>
+      <div class="sec" style="padding-top:0">
         <div class="card"><div class="card-hdr">Format Guide</div>
           <div class="card-body" style="font-size:13px;color:var(--text-2);line-height:1.7">
             <p><strong style="color:var(--text-1)">Long format (Pressure XS Pro):</strong> Device, Metric, Value, Time columns — imported directly, no changes needed.</p>
@@ -910,6 +942,67 @@ const App = (() => {
           preview.innerHTML=''; setView('dashboard');
         });
       } catch(err){console.error(err);toast('Error reading file','err');preview.innerHTML='';}
+    }
+
+    renderOxilineSyncCard();
+    function renderOxilineSyncCard(){
+      const body=document.getElementById('oxiline-sync-body');
+      if(!OxilineSync.isSupported()){
+        body.innerHTML=`<div style="font-size:13px;color:var(--text-2);line-height:1.6">Sync needs Chrome on Android. It isn't supported in this browser (e.g. iPhone/Safari).</div>`;
+        return;
+      }
+      body.innerHTML=`
+        <div id="ox-status" style="font-size:13px;color:var(--text-2);line-height:1.6;margin-bottom:12px">Wake the cuff and keep it on, then tap Sync.</div>
+        <button class="btn btn-primary" id="ox-sync-btn">Sync from Oxiline Pressure XS Pro</button>
+      `;
+      const statusEl=document.getElementById('ox-status');
+      const btn=document.getElementById('ox-sync-btn');
+      const setStatus=(msg,type='')=>{
+        statusEl.textContent=msg;
+        statusEl.style.color = type==='err' ? 'var(--sys)' : type==='ok' ? 'var(--bpm)' : 'var(--text-2)';
+      };
+
+      btn.addEventListener('click', async ()=>{
+        btn.disabled=true;
+        setStatus('Connecting to Oxiline Pressure XS Pro…');
+        let imported=0, dupes=0;
+        try{
+          const existing=new Set((await DB.getReadings()).map(r=>r.timestamp));
+          await OxilineSync.sync({
+            onStatus(stage, info){
+              if(stage==='in-progress') setStatus(`Syncing… retrieved ${info.count} reading${info.count!==1?'s':''}`);
+            },
+            async onRecord(rec){
+              if(existing.has(rec.timestamp)){ dupes++; return; }
+              existing.add(rec.timestamp);
+              await DB.addReading({ timestamp:rec.timestamp, systolic:rec.systolic, diastolic:rec.diastolic, bpm:rec.bpm, deviceFlag:rec.deviceFlag });
+              imported++;
+            },
+          });
+          if(imported===0){
+            setStatus('Already up to date — no new readings found.','ok');
+          } else {
+            setStatus(`Sync complete — imported ${imported} new reading${imported!==1?'s':''} (${dupes} already on file).`,'ok');
+            toast(`Imported ${imported} reading${imported!==1?'s':''} from Oxiline`,'ok');
+          }
+        } catch(err){
+          if(err?.code==='cancelled'){
+            setStatus('Wake the cuff and keep it on, then tap Sync.');
+          } else if(err?.code==='unsupported'){
+            setStatus("Sync needs Chrome on Android. It isn't supported in this browser (e.g. iPhone/Safari).",'err');
+          } else if(err?.code==='connect-failed'){
+            setStatus("Couldn't connect. Make sure the cuff is awake and nearby, and not connected to the Oxiline app.",'err');
+          } else if(err?.code==='mid-run-failure'){
+            const n=err.partialCount||0;
+            setStatus(n>0 ? `Connection dropped after ${n} reading${n!==1?'s':''}. Those ${n} were saved — tap Sync to resume.` : "Couldn't connect. Make sure the cuff is awake and nearby, and not connected to the Oxiline app.",'err');
+          } else {
+            console.error(err);
+            setStatus('Something went wrong during sync. Tap Sync to try again.','err');
+          }
+        } finally {
+          btn.disabled=false;
+        }
+      });
     }
   }
 
