@@ -241,11 +241,10 @@ body {
 }
 .ut-btn {
   border: none; background: var(--surface); color: var(--text-2);
-  font-size: 13px; font-weight: 700; padding: 8px 16px;
+  font-size: 11px; font-weight: 700; padding: 5px 11px;
   cursor: pointer; font-family: var(--font); transition: all .15s;
 }
-.ut-btn[data-unit="pct"].active  { background: var(--accent); color: #fff; }
-.ut-btn[data-unit="mmhg"].active { background: var(--dia);    color: #fff; }
+.ut-btn.active { background: var(--text-1); color: #fff; }
 .ut-btn:not(.active):hover { background: var(--surface-2); }
 
 /* ── Empty state ── */
@@ -368,11 +367,16 @@ textarea.finput { resize: vertical; min-height: 88px; font-size: 14px; line-heig
   border-radius: var(--r-md); padding: 13px; margin-bottom: 8px;
 }
 .note-text { font-size: 14px; line-height: 1.6; white-space: pre-wrap; color: var(--text-1); }
-.note-hdr {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  margin-bottom: 7px; gap: 8px;
+.note-meta {
+  font-size: 11px; color: var(--text-3); margin-top: 8px;
+  display: flex; justify-content: space-between; align-items: center;
 }
-.note-date { font-size: 12px; font-weight: 800; color: var(--text-1); }
+.del-note {
+  background: none; border: none; cursor: pointer;
+  color: var(--sys); font-size: 11px; font-weight: 700;
+  font-family: var(--font); padding: 2px 6px;
+}
+.del-note:hover { text-decoration: underline; }
 
 /* ── Icon buttons (edit / delete in reading rows) ── */
 .icon-btn {
