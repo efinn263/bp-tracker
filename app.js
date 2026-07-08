@@ -162,10 +162,11 @@ const App = (() => {
     return d.toISOString().slice(0,16);
   }
   function getRangeTs(){
-    const now=Date.now(), map={'7d':7,'14d':14,'30d':30};
+    const now=Date.now(), map={'7d':7,'30d':30};
     if(S.range==='all')    return {start:null,end:null};
     if(S.range==='custom') return {start:S.customStart?new Date(S.customStart).getTime():null, end:S.customEnd?new Date(S.customEnd).getTime():now};
     if(S.range==='8h')     return {start:now-8*3600000, end:now};
+    if(S.range==='24h')    return {start:now-24*3600000, end:now};
     return {start:now-(map[S.range]||7)*86400000, end:now};
   }
   function toast(msg,type=''){
@@ -257,18 +258,18 @@ const App = (() => {
   ═══════════════════════════ */
   async function renderDashboard(main){
     const {start,end}=getRangeTs();
-    const [readings,medEvents,allR]=await Promise.all([
-      DB.getReadings(start,end), DB.getMedEvents(start,end), DB.getReadings()
+    const [readings,allR,medEvents]=await Promise.all([
+      DB.getReadings(start,end), DB.getReadings(), DB.getMedEvents()
     ]);
     const latest=allR.sort((a,b)=>a.timestamp-b.timestamp).at(-1);
     const avgSys=round(avg(readings,'systolic'));
     const avgDia=round(avg(readings,'diastolic'));
     const avgBpm=round(avg(readings,'bpm'));
-    const rlbl={'8h':'8H','7d':'7D','14d':'14D','30d':'30D','all':'All'};
+    const rlbl={'8h':'8H','24h':'24H','7d':'7D','30d':'30D','all':'All'};
 
     main.innerHTML=`
       <div class="range-tabs" id="range-tabs">
-        ${['8h','7d','14d','30d','all'].map(r=>`<button class="rtab${S.range===r?' active':''}" data-range="${r}">${rlbl[r]}</button>`).join('')}
+        ${['8h','24h','7d','30d','all'].map(r=>`<button class="rtab${S.range===r?' active':''}" data-range="${r}">${rlbl[r]}</button>`).join('')}
       </div>
       <div class="sec">
         <div class="card">
@@ -346,7 +347,7 @@ const App = (() => {
       </div>
     `;
 
-    initChart(readings, medEvents);
+    initChart(allR, medEvents, start, end);
 
     document.getElementById('range-tabs').addEventListener('click', e=>{
       const b=e.target.closest('[data-range]');
@@ -376,13 +377,45 @@ const App = (() => {
     );
   }
 
-  /* ── Chart (dual Y-axis) ── */
-  function initChart(readings, medEvents){
+  /* ── BP y-axis bounds: a fixed reference range (50-200mmHg), widened only
+     if actual data falls outside it — kept a hard min/max (not "suggested")
+     so the BPM axis math below can rely on exactly where the axis sits. ── */
+  const BP_AXIS_MIN=50, BP_AXIS_MAX=200;
+  function getBpAxisRange(readings){
+    const vals=[...readings.map(r=>r.systolic),...readings.map(r=>r.diastolic)].filter(v=>v!=null);
+    const min=vals.length?Math.min(BP_AXIS_MIN, Math.floor(Math.min(...vals)/10)*10):BP_AXIS_MIN;
+    const max=vals.length?Math.max(BP_AXIS_MAX, Math.ceil(Math.max(...vals)/10)*10):BP_AXIS_MAX;
+    return {min,max};
+  }
+
+  /* ── BPM axis range: push the BPM line into a band clearly below wherever
+     the diastolic data actually sits, so it never visually crosses through
+     the systolic/diastolic zone even when raw bpm/dia values are similar. ── */
+  function getBpmAxisRange(readings, bpAxisMin, bpAxisMax){
+    const bpmVals=readings.map(r=>r.bpm).filter(v=>v!=null);
+    const diaVals=readings.map(r=>r.diastolic).filter(v=>v!=null);
+    const bpmMin=bpmVals.length?Math.min(...bpmVals):50, bpmMax=bpmVals.length?Math.max(...bpmVals):100;
+    const diaFloor=diaVals.length?Math.min(...diaVals):70;
+    const diaFloorFrac=(diaFloor-bpAxisMin)/(bpAxisMax-bpAxisMin);
+    // Target: bpm's highest value maps to well under half of where the
+    // diastolic band starts, with a small floor so the axis math stays sane.
+    const targetFrac=Math.max(0.02, Math.min(0.28, diaFloorFrac*0.55));
+    const min=Math.max(0, Math.floor((bpmMin-10)/10)*10);
+    const span=Math.max(bpmMax-min, 15);
+    const max=Math.ceil((min+span/targetFrac)/10)*10;
+    return {min,max,dataMax:bpmMax};
+  }
+
+  /* ── Chart (dual Y-axis). `readings`/`medEvents` are the FULL dataset —
+     viewStart/viewEnd only set the chart's initial zoom window; panning
+     beyond it still reveals the rest of the data, nothing is hidden. ── */
+  function initChart(readings, medEvents, viewStart, viewEnd){
     const canvas=document.getElementById('chart');
     if(!canvas) return;
     if(S.chart){S.chart.destroy(); S.chart=null;}
 
-    const r=readings.length<80?4:2;
+    const visible=(viewStart&&viewEnd)?readings.filter(x=>x.timestamp>=viewStart&&x.timestamp<=viewEnd):readings;
+    const r=visible.length<80?4:2;
     const mkDs=(label,data,color,dash,yid)=>({
       label, data,
       borderColor:color, backgroundColor:color+'15',
@@ -390,6 +423,8 @@ const App = (() => {
       pointRadius:r, pointHoverRadius:r+3, pointBackgroundColor:color,
       tension:0.3, fill:false, yAxisID:yid,
     });
+    const bpAxis=getBpAxisRange(readings);
+    const bpmAxis=getBpmAxisRange(readings, bpAxis.min, bpAxis.max);
 
     S.chart=new Chart(canvas,{
       type:'line',
@@ -405,13 +440,14 @@ const App = (() => {
         scales:{
           x:{
             type:'time',
+            min: viewStart ?? undefined, max: viewEnd ?? undefined,
             time:{displayFormats:{minute:'MMM d HH:mm',hour:'MMM d HH:mm',day:'MMM d',week:'MMM d',month:'MMM yy'}},
             grid:{color:'rgba(0,0,0,.04)'},
             ticks:{font:{family:'system-ui,sans-serif',size:10},color:'#9b9895',maxTicksLimit:6,maxRotation:0},
           },
           y:{
             position:'left',
-            suggestedMin:50, suggestedMax:200,
+            min:bpAxis.min, max:bpAxis.max,
             grid:{color:'rgba(0,0,0,.04)'},
             ticks:{font:{family:'system-ui,sans-serif',size:10},color:'#9b9895'},
             title:{display:true,text:'mmHg',font:{size:10},color:'#9b9895'},
@@ -419,9 +455,13 @@ const App = (() => {
           y1:{
             position:'right',
             display:S.showBpm,
-            suggestedMin:40, suggestedMax:130,
+            min:bpmAxis.min, max:bpmAxis.max,
             grid:{drawOnChartArea:false},
-            ticks:{font:{family:'system-ui,sans-serif',size:10},color:'#4a9068'},
+            ticks:{
+              font:{family:'system-ui,sans-serif',size:10},color:'#4a9068',
+              maxTicksLimit:5,
+              callback:v=> v<=bpmAxis.dataMax+15 ? v : '',
+            },
             title:{display:true,text:'BPM',font:{size:10},color:'#4a9068'},
           },
         },
@@ -568,11 +608,14 @@ const App = (() => {
         <div id="notes-list">
           ${[...notes].reverse().map(n=>`
           <div class="note-card">
-            <div class="note-text">${esc(n.text)}</div>
-            <div class="note-meta">
-              <span>${fmtDT(n.timestamp)}</span>
-              <button class="del-note" data-del-note="${n.id}">Delete</button>
+            <div class="note-hdr">
+              <span class="note-date">${fmtDT(n.timestamp)}</span>
+              <div style="display:flex;gap:2px">
+                <button class="icon-btn" data-edit-note="${n.id}" title="Edit">${svgEdit()}</button>
+                <button class="icon-btn del" data-del-note="${n.id}" title="Delete">${svgX()}</button>
+              </div>
             </div>
+            <div class="note-text">${esc(n.text)}</div>
           </div>`).join('')}
         </div>`:
         `<div class="empty"><div class="empty-icon">📝</div><div class="empty-title">No notes yet</div>
@@ -585,6 +628,12 @@ const App = (() => {
       await DB.addNote({timestamp:Date.now(),text:txt});
       toast('Note saved','ok'); renderNotes(main);
     });
+    main.querySelectorAll('[data-edit-note]').forEach(btn=>
+      btn.addEventListener('click',()=>{
+        const n=notes.find(x=>x.id===btn.dataset.editNote);
+        if(n) showEditNoteModal(n, ()=>renderNotes(main));
+      })
+    );
     main.querySelectorAll('[data-del-note]').forEach(btn=>
       btn.addEventListener('click',async()=>{
         if(!confirm('Delete this note?')) return;
@@ -592,6 +641,37 @@ const App = (() => {
         toast('Note deleted'); renderNotes(main);
       })
     );
+  }
+
+  /* ── Edit Note Modal (preserves original timestamp) ── */
+  function showEditNoteModal(note, onSave){
+    const modal=document.createElement('div');
+    modal.className='modal-overlay';
+    modal.innerHTML=`
+      <div class="modal-sheet">
+        <div class="modal-hdr">
+          <span>Edit Note</span>
+          <button class="modal-close" id="en-close">Close</button>
+        </div>
+        <div class="form">
+          <div class="fg"><label class="flabel">${fmtDT(note.timestamp)}</label>
+            <textarea class="finput" id="en-txt" rows="4">${esc(note.text)}</textarea>
+          </div>
+          <button class="btn btn-primary btn-full" id="en-save">Save Changes</button>
+          <div style="height:8px"></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    const close=()=>modal.remove();
+    document.getElementById('en-close').addEventListener('click',close);
+    modal.addEventListener('click',e=>{if(e.target===modal)close();});
+    document.getElementById('en-save').addEventListener('click',async()=>{
+      const txt=document.getElementById('en-txt').value.trim();
+      if(!txt){toast('Write something first','err');return;}
+      await DB.addNote({id:note.id, timestamp:note.timestamp, text:txt});
+      toast('Note updated','ok'); close(); onSave?.();
+    });
   }
 
   /* ═══════════════════════════
@@ -1023,6 +1103,23 @@ const App = (() => {
         </div>
       </div></div>
       <div class="sec"><div class="card">
+        <div class="card-hdr">PDF Report</div>
+        <div class="card-body">
+          <div class="vsub" style="padding:0 0 10px">Dashboard summary, medication events with graphs, and notes for a chosen period</div>
+          <div class="range-tabs" id="report-range-tabs" style="padding:0 0 12px">
+            <button class="rtab active" data-rrange="1d">1 Day</button>
+            <button class="rtab" data-rrange="3d">3 Days</button>
+            <button class="rtab" data-rrange="7d">Week</button>
+            <button class="rtab" data-rrange="custom">Custom</button>
+          </div>
+          <div class="frow" id="report-custom-range" style="display:none;margin-bottom:12px">
+            <div class="fg"><label class="flabel">Start</label><input type="datetime-local" class="finput" id="report-start"></div>
+            <div class="fg"><label class="flabel">End</label><input type="datetime-local" class="finput" id="report-end" value="${isoNow()}"></div>
+          </div>
+          <button class="btn btn-primary btn-full" id="gen-report">Generate PDF Report</button>
+        </div>
+      </div></div>
+      <div class="sec"><div class="card">
         <div class="card-hdr">Storage</div>
         <div class="setting-row" style="cursor:default">
           <div class="sr-info"><div class="sr-label">Readings stored</div><div class="sr-desc">All data is stored locally on this device</div></div>
@@ -1060,6 +1157,306 @@ const App = (() => {
       await DB.importAll({readings:[],medEvents:[],notes:[]},false);
       toast('All data cleared'); renderSettings(main);
     });
+
+    let reportRange='1d';
+    document.getElementById('report-range-tabs').addEventListener('click',e=>{
+      const b=e.target.closest('[data-rrange]'); if(!b) return;
+      reportRange=b.dataset.rrange;
+      main.querySelectorAll('#report-range-tabs .rtab').forEach(x=>x.classList.toggle('active',x===b));
+      document.getElementById('report-custom-range').style.display=reportRange==='custom'?'grid':'none';
+    });
+    document.getElementById('gen-report').addEventListener('click',async()=>{
+      const now=Date.now();
+      let start,end;
+      if(reportRange==='1d'){ start=now-1*86400000; end=now; }
+      else if(reportRange==='3d'){ start=now-3*86400000; end=now; }
+      else if(reportRange==='7d'){ start=now-7*86400000; end=now; }
+      else {
+        const s=document.getElementById('report-start').value, e2=document.getElementById('report-end').value;
+        if(!s||!e2){ toast('Select a custom start and end date','err'); return; }
+        start=new Date(s).getTime(); end=new Date(e2).getTime();
+        if(start>=end){ toast('Start must be before end','err'); return; }
+      }
+      const btn=document.getElementById('gen-report');
+      btn.disabled=true; const orig=btn.textContent; btn.textContent='Generating…';
+      try{
+        await generatePdfReport(start,end);
+        toast('Report downloaded','ok');
+      } catch(err){
+        console.error(err);
+        toast('Failed to generate report','err');
+      }
+      btn.disabled=false; btn.textContent=orig;
+    });
+  }
+
+  /* ═══════════════════════════
+     PDF REPORT
+  ═══════════════════════════ */
+
+  /* Render an offscreen (never-attached) chart to a PNG data URL */
+  function chartImageURL(config, pxWidth, pxHeight){
+    const canvas=document.createElement('canvas');
+    canvas.width=pxWidth; canvas.height=pxHeight;
+    const chart=new Chart(canvas, config);
+    chart.update('none');
+    const url=canvas.toDataURL('image/png');
+    chart.destroy();
+    return url;
+  }
+
+  function reportDashboardChartImage(readings, medEvents, pxWidth, pxHeight){
+    const bpAxis=getBpAxisRange(readings);
+    const bpmAxis=getBpmAxisRange(readings, bpAxis.min, bpAxis.max);
+    const hasBpm=readings.some(r=>r.bpm!=null);
+    const mkDs=(label,data,color,dash,yid)=>({
+      label,data,borderColor:color,backgroundColor:color+'15',
+      borderWidth:2,borderDash:dash?[6,3]:[],pointRadius:2,pointBackgroundColor:color,
+      tension:0.3,fill:false,yAxisID:yid,
+    });
+    const datasets=[
+      mkDs('Systolic',  readings.filter(x=>x.systolic !=null).map(x=>({x:x.timestamp,y:x.systolic })), '#c05252', false,'y'),
+      mkDs('Diastolic', readings.filter(x=>x.diastolic!=null).map(x=>({x:x.timestamp,y:x.diastolic})), '#3b7bbf', false,'y'),
+    ];
+    if(hasBpm) datasets.push(mkDs('BPM', readings.filter(x=>x.bpm!=null).map(x=>({x:x.timestamp,y:x.bpm})), '#4a9068', true, 'y1'));
+    return chartImageURL({
+      type:'line',
+      data:{datasets},
+      options:{
+        responsive:false, animation:false,
+        scales:{
+          x:{type:'time', time:{displayFormats:{minute:'MMM d HH:mm',hour:'MMM d HH:mm',day:'MMM d'}},
+            ticks:{font:{size:11},color:'#6b6862',maxTicksLimit:7,maxRotation:0}, grid:{color:'rgba(0,0,0,.06)'}},
+          y:{position:'left', min:bpAxis.min, max:bpAxis.max,
+            ticks:{font:{size:11},color:'#6b6862'}, grid:{color:'rgba(0,0,0,.06)'},
+            title:{display:true,text:'mmHg',font:{size:11},color:'#6b6862'}},
+          y1:{position:'right', display:hasBpm, min:bpmAxis.min, max:bpmAxis.max,
+            grid:{drawOnChartArea:false},
+            ticks:{font:{size:11},color:'#4a9068',callback:v=>v<=bpmAxis.dataMax+15?v:''},
+            title:{display:true,text:'BPM',font:{size:11},color:'#4a9068'}},
+        },
+        plugins:{
+          legend:{display:true,position:'top',labels:{font:{size:11},boxWidth:12,color:'#1a1916'}},
+          medLines:{timestamps:medEvents.map(e=>e.timestamp)},
+          tooltip:{enabled:false},
+        },
+      },
+    }, pxWidth, pxHeight);
+  }
+
+  function reportMedChartImage(sysD, diaD, ts, wStart, wEnd, lines, pxWidth, pxHeight){
+    return chartImageURL({
+      type:'line',
+      data:{datasets:[
+        {label:'Systolic',data:sysD,borderColor:'#c05252',backgroundColor:'#c0525215',borderWidth:2,pointRadius:3,tension:0.3,fill:false},
+        {label:'Diastolic',data:diaD,borderColor:'#3b7bbf',backgroundColor:'#3b7bbf15',borderWidth:2,pointRadius:3,tension:0.3,fill:false},
+      ]},
+      options:{
+        responsive:false, animation:false,
+        scales:{
+          x:{type:'time', time:{displayFormats:{minute:'HH:mm',hour:'MMM d HH:mm'}}, min:wStart, max:wEnd,
+            ticks:{font:{size:10},color:'#6b6862',maxTicksLimit:5,maxRotation:0}, grid:{color:'rgba(0,0,0,.06)'}},
+          y:{suggestedMin:50,suggestedMax:180,
+            ticks:{font:{size:10},color:'#6b6862'}, grid:{color:'rgba(0,0,0,.06)'},
+            title:{display:true,text:'mmHg',font:{size:10},color:'#6b6862'}},
+        },
+        plugins:{
+          legend:{display:true,position:'top',labels:{font:{size:10},boxWidth:10,color:'#1a1916'}},
+          medLines:{timestamps:[ts]},
+          baselineShift:{lines},
+          tooltip:{enabled:false},
+        },
+      },
+    }, pxWidth, pxHeight);
+  }
+
+  async function generatePdfReport(start,end){
+    const [readings, medEventsAll, notesAll, allReadings]=await Promise.all([
+      DB.getReadings(start,end), DB.getMedEvents(), DB.getNotes(), DB.getReadings()
+    ]);
+    const medEvents=medEventsAll.filter(e=>e.timestamp>=start&&e.timestamp<=end).sort((a,b)=>a.timestamp-b.timestamp);
+    const notes=notesAll.filter(n=>n.timestamp>=start&&n.timestamp<=end).sort((a,b)=>a.timestamp-b.timestamp);
+
+    const avgSys=round(avg(readings,'systolic'));
+    const avgDia=round(avg(readings,'diastolic'));
+    const avgBpm=round(avg(readings,'bpm'));
+    const dashUrl=reportDashboardChartImage(readings, medEvents, 900, 320);
+
+    const eventReports=medEvents.map(ev=>{
+      const winBef=ev.baselineWindow||120, winAft=ev.postDoseWindow||150;
+      const baseline=getBaselineReadings(allReadings,ev.timestamp,winBef);
+      const after=allReadings.filter(r=>r.timestamp>ev.timestamp&&r.timestamp<=ev.timestamp+winAft*60000);
+      const bSys=round(avg(baseline,'systolic'),1), bDia=round(avg(baseline,'diastolic'),1);
+      const pSys=round(avg(after,'systolic'),1),    pDia=round(avg(after,'diastolic'),1);
+      const sysRed=(bSys!=null&&pSys!=null)?round((bSys-pSys)/bSys*100,1):null;
+      const diaRed=(bDia!=null&&pDia!=null)?round((bDia-pDia)/bDia*100,1):null;
+      const sysMmhg=(bSys!=null&&pSys!=null)?round(bSys-pSys,1):null;
+      const diaMmhg=(bDia!=null&&pDia!=null)?round(bDia-pDia,1):null;
+      const sysPeak=peakReduction(bSys,after,'systolic',ev.timestamp);
+      const diaPeak=peakReduction(bDia,after,'diastolic',ev.timestamp);
+      const wStart=ev.timestamp-winBef*60000, wEnd=ev.timestamp+winAft*60000;
+      const inWin=allReadings.filter(r=>r.timestamp>=wStart&&r.timestamp<=wEnd);
+      const sysD=inWin.filter(r=>r.systolic !=null).map(r=>({x:r.timestamp,y:r.systolic }));
+      const diaD=inWin.filter(r=>r.diastolic!=null).map(r=>({x:r.timestamp,y:r.diastolic}));
+      const lines=[
+        {value:bSys, color:'rgba(192,82,82,.5)',  dash:[3,3], label:'Baseline'},
+        {value:pSys, color:'rgba(192,82,82,.95)', dash:[8,3], label:'Post-dose'},
+        {value:bDia, color:'rgba(59,123,191,.5)', dash:[3,3], label:'Baseline'},
+        {value:pDia, color:'rgba(59,123,191,.95)',dash:[8,3], label:'Post-dose'},
+      ];
+      const img=reportMedChartImage(sysD,diaD,ev.timestamp,wStart,wEnd,lines,680,260);
+      return {ev,bSys,bDia,pSys,pDia,sysRed,diaRed,sysMmhg,diaMmhg,sysPeak,diaPeak,
+        bCount:baseline.length,pCount:after.length,img};
+    });
+
+    buildPdf({start,end,avgSys,avgDia,avgBpm,readingsCount:readings.length,dashUrl,eventReports,notes});
+  }
+
+  function buildPdf({start,end,avgSys,avgDia,avgBpm,readingsCount,dashUrl,eventReports,notes}){
+    const { jsPDF } = window.jspdf;
+    const doc=new jsPDF({unit:'mm',format:'a4'});
+    const PW=210, PH=297, MX=14;
+    let y=0;
+
+    const C={
+      accent:[99,102,241], sys:[192,82,82], dia:[59,123,191], bpm:[74,144,104],
+      text1:[26,25,22], text2:[107,104,98], text3:[155,152,149], border:[227,225,218],
+    };
+
+    const rangeLabel=`${new Date(start).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})} – `+
+      `${new Date(end).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})}`;
+
+    function drawHeader(){
+      doc.setFillColor(...C.accent);
+      doc.rect(0,0,PW,24,'F');
+      doc.setTextColor(255,255,255);
+      doc.setFont('helvetica','bold'); doc.setFontSize(16);
+      doc.text('BP Tracker Report', MX, 14);
+      doc.setFont('helvetica','normal'); doc.setFontSize(9);
+      doc.text(rangeLabel, MX, 20);
+      y=32;
+    }
+    function checkBreak(need){
+      if(y+need>PH-16){
+        doc.addPage();
+        doc.setDrawColor(...C.accent); doc.setLineWidth(1);
+        doc.line(0,10,PW,10);
+        y=18;
+      }
+    }
+    function sectionTitle(text){
+      checkBreak(12);
+      doc.setTextColor(...C.text1); doc.setFont('helvetica','bold'); doc.setFontSize(12);
+      doc.text(text, MX, y);
+      doc.setDrawColor(...C.border); doc.setLineWidth(0.3);
+      doc.line(MX, y+2, PW-MX, y+2);
+      y+=9;
+    }
+
+    drawHeader();
+
+    // Summary
+    sectionTitle('Summary');
+    const stats=[['Systolic avg',avgSys,C.sys],['Diastolic avg',avgDia,C.dia],['BPM avg',avgBpm,C.bpm]];
+    const boxW=(PW-2*MX-2*6)/3;
+    stats.forEach(([label,val,color],i)=>{
+      const bx=MX+i*(boxW+6);
+      doc.setDrawColor(...C.border); doc.setLineWidth(0.3);
+      doc.roundedRect(bx,y,boxW,20,2,2);
+      doc.setTextColor(...C.text3); doc.setFont('helvetica','bold'); doc.setFontSize(7.5);
+      doc.text(label.toUpperCase(), bx+4, y+7);
+      doc.setTextColor(...color); doc.setFont('helvetica','bold'); doc.setFontSize(15);
+      doc.text(val!=null?String(val):'—', bx+4, y+16);
+    });
+    y+=26;
+    doc.setTextColor(...C.text2); doc.setFont('helvetica','normal'); doc.setFontSize(9);
+    doc.text(`${readingsCount} reading${readingsCount!==1?'s':''} in this range`, MX, y);
+    y+=8;
+
+    // Dashboard chart
+    sectionTitle('Blood Pressure & Heart Rate');
+    const imgW=PW-2*MX, imgH=imgW*(320/900);
+    checkBreak(imgH+4);
+    doc.addImage(dashUrl,'PNG',MX,y,imgW,imgH);
+    y+=imgH+10;
+
+    // Medications
+    if(eventReports.length){
+      checkBreak(14);
+      sectionTitle(`Medication Events (${eventReports.length})`);
+      for(const r of eventReports){
+        checkBreak(60);
+        doc.setTextColor(...C.text1); doc.setFont('helvetica','bold'); doc.setFontSize(11);
+        doc.text(`${r.ev.medication||'Medication'}${r.ev.dose?' — '+r.ev.dose:''}`, MX, y);
+        doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(...C.text2);
+        doc.text(new Date(r.ev.timestamp).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}), MX, y+5);
+        y+=9;
+
+        doc.setFontSize(9); doc.setTextColor(...C.text2);
+        doc.text(`Baseline (${r.bCount}): ${r.bSys??'—'}/${r.bDia??'—'} mmHg`, MX, y);
+        doc.text(`Post-dose (${r.pCount}): ${r.pSys??'—'}/${r.pDia??'—'} mmHg`, MX+95, y);
+        y+=6;
+
+        const parts=[];
+        if(r.sysRed!=null) parts.push(`Sys ${Math.abs(r.sysRed)}% (${Math.abs(r.sysMmhg)} mmHg) ${r.sysRed>=0?'reduction':'increase'}`);
+        if(r.diaRed!=null) parts.push(`Dia ${Math.abs(r.diaRed)}% (${Math.abs(r.diaMmhg)} mmHg) ${r.diaRed>=0?'reduction':'increase'}`);
+        if(parts.length){
+          doc.setTextColor(...C.text1); doc.setFont('helvetica','bold'); doc.setFontSize(9.5);
+          doc.text(parts.join('    '), MX, y);
+          y+=6;
+        }
+        if(r.sysPeak||r.diaPeak){
+          const pk=[];
+          if(r.sysPeak) pk.push(`Sys: ${Math.abs(r.sysPeak.mmhg)} mmHg peak ${r.sysPeak.mmhg>=0?'reduction':'increase'} in ${Math.abs(r.sysPeak.hours)}h`);
+          if(r.diaPeak) pk.push(`Dia: ${Math.abs(r.diaPeak.mmhg)} mmHg peak ${r.diaPeak.mmhg>=0?'reduction':'increase'} in ${Math.abs(r.diaPeak.hours)}h`);
+          doc.setFont('helvetica','normal'); doc.setTextColor(...C.text2); doc.setFontSize(8.5);
+          doc.text(pk.join('    '), MX, y);
+          y+=7;
+        }
+
+        const imW2=PW-2*MX-40, imH2=imW2*(260/680);
+        checkBreak(imH2+8);
+        doc.addImage(r.img,'PNG',MX+20,y,imW2,imH2);
+        y+=imH2+4;
+
+        if(r.ev.notes){
+          doc.setFont('helvetica','italic'); doc.setFontSize(8.5); doc.setTextColor(...C.text2);
+          const lines=doc.splitTextToSize(r.ev.notes, PW-2*MX);
+          checkBreak(lines.length*4+2);
+          doc.text(lines, MX, y); y+=lines.length*4+2;
+        }
+
+        doc.setDrawColor(...C.border); doc.setLineWidth(0.2);
+        doc.line(MX,y,PW-MX,y); y+=8;
+      }
+    }
+
+    // Notes
+    if(notes.length){
+      checkBreak(14);
+      sectionTitle(`Notes (${notes.length})`);
+      for(const n of notes){
+        checkBreak(16);
+        doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...C.text1);
+        doc.text(new Date(n.timestamp).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'}), MX, y);
+        y+=5;
+        doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(...C.text1);
+        const lines=doc.splitTextToSize(n.text, PW-2*MX);
+        checkBreak(lines.length*4.2+6);
+        doc.text(lines, MX, y);
+        y+=lines.length*4.2+7;
+      }
+    }
+
+    const pageCount=doc.internal.getNumberOfPages();
+    for(let i=1;i<=pageCount;i++){
+      doc.setPage(i);
+      doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(...C.text3);
+      doc.text(`Page ${i} of ${pageCount}`, PW-MX, PH-8, {align:'right'});
+    }
+
+    const fname=`bp-report-${new Date(start).toISOString().slice(0,10)}_to_${new Date(end).toISOString().slice(0,10)}.pdf`;
+    doc.save(fname);
   }
 
   /* ── Init ── */
