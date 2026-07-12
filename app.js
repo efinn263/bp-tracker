@@ -1105,11 +1105,12 @@ const App = (() => {
       <div class="sec"><div class="card">
         <div class="card-hdr">PDF Report</div>
         <div class="card-body">
-          <div class="vsub" style="padding:0 0 10px">Dashboard summary, medication events with graphs, and notes for a chosen period</div>
+          <div class="vsub" style="padding:0 0 10px">Dashboard summary, blood pressure log, medication events with graphs, and notes for a chosen period</div>
           <div class="range-tabs" id="report-range-tabs" style="padding:0 0 12px">
             <button class="rtab active" data-rrange="1d">1 Day</button>
             <button class="rtab" data-rrange="3d">3 Days</button>
             <button class="rtab" data-rrange="7d">Week</button>
+            <button class="rtab" data-rrange="all">All</button>
             <button class="rtab" data-rrange="custom">Custom</button>
           </div>
           <div class="frow" id="report-custom-range" style="display:none;margin-bottom:12px">
@@ -1171,6 +1172,7 @@ const App = (() => {
       if(reportRange==='1d'){ start=now-1*86400000; end=now; }
       else if(reportRange==='3d'){ start=now-3*86400000; end=now; }
       else if(reportRange==='7d'){ start=now-7*86400000; end=now; }
+      else if(reportRange==='all'){ start=null; end=now; }
       else {
         const s=document.getElementById('report-start').value, e2=document.getElementById('report-end').value;
         if(!s||!e2){ toast('Select a custom start and end date','err'); return; }
@@ -1274,8 +1276,9 @@ const App = (() => {
     const [readings, medEventsAll, notesAll, allReadings]=await Promise.all([
       DB.getReadings(start,end), DB.getMedEvents(), DB.getNotes(), DB.getReadings()
     ]);
-    const medEvents=medEventsAll.filter(e=>e.timestamp>=start&&e.timestamp<=end).sort((a,b)=>a.timestamp-b.timestamp);
-    const notes=notesAll.filter(n=>n.timestamp>=start&&n.timestamp<=end).sort((a,b)=>a.timestamp-b.timestamp);
+    const inRange=ts=>(start==null||ts>=start)&&(end==null||ts<=end);
+    const medEvents=medEventsAll.filter(e=>inRange(e.timestamp)).sort((a,b)=>a.timestamp-b.timestamp);
+    const notes=notesAll.filter(n=>inRange(n.timestamp)).sort((a,b)=>a.timestamp-b.timestamp);
 
     const avgSys=round(avg(readings,'systolic'));
     const avgDia=round(avg(readings,'diastolic'));
@@ -1309,10 +1312,10 @@ const App = (() => {
         bCount:baseline.length,pCount:after.length,img};
     });
 
-    buildPdf({start,end,avgSys,avgDia,avgBpm,readingsCount:readings.length,dashUrl,eventReports,notes});
+    buildPdf({start,end,avgSys,avgDia,avgBpm,readings,dashUrl,eventReports,notes});
   }
 
-  function buildPdf({start,end,avgSys,avgDia,avgBpm,readingsCount,dashUrl,eventReports,notes}){
+  function buildPdf({start,end,avgSys,avgDia,avgBpm,readings,dashUrl,eventReports,notes}){
     const { jsPDF } = window.jspdf;
     const doc=new jsPDF({unit:'mm',format:'a4'});
     const PW=210, PH=297, MX=14;
@@ -1323,8 +1326,10 @@ const App = (() => {
       text1:[26,25,22], text2:[107,104,98], text3:[155,152,149], border:[227,225,218],
     };
 
-    const rangeLabel=`${new Date(start).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})} – `+
-      `${new Date(end).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})}`;
+    const fmtFull=ts=>new Date(ts).toLocaleString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    const rangeLabel = start==null
+      ? `All time  ·  through ${fmtFull(end)}`
+      : `${fmtFull(start)} – ${fmtFull(end)}`;
 
     function drawHeader(){
       doc.setFillColor(...C.accent);
@@ -1336,12 +1341,13 @@ const App = (() => {
       doc.text(rangeLabel, MX, 20);
       y=32;
     }
-    function checkBreak(need){
+    function checkBreak(need, onNewPage){
       if(y+need>PH-16){
         doc.addPage();
         doc.setDrawColor(...C.accent); doc.setLineWidth(1);
         doc.line(0,10,PW,10);
         y=18;
+        onNewPage?.();
       }
     }
     function sectionTitle(text){
@@ -1370,7 +1376,7 @@ const App = (() => {
     });
     y+=26;
     doc.setTextColor(...C.text2); doc.setFont('helvetica','normal'); doc.setFontSize(9);
-    doc.text(`${readingsCount} reading${readingsCount!==1?'s':''} in this range`, MX, y);
+    doc.text(`${readings.length} reading${readings.length!==1?'s':''} in this range`, MX, y);
     y+=8;
 
     // Dashboard chart
@@ -1379,6 +1385,60 @@ const App = (() => {
     checkBreak(imgH+4);
     doc.addImage(dashUrl,'PNG',MX,y,imgW,imgH);
     y+=imgH+10;
+
+    // Blood Pressure Log (individual readings)
+    if(readings.length){
+      checkBreak(14);
+      sectionTitle(`Blood Pressure Log (${readings.length})`);
+
+      const logCols=[
+        {label:'DATE', w:24},
+        {label:'TIME', w:16},
+        {label:'SYS',  w:13},
+        {label:'DIA',  w:13},
+        {label:'BPM',  w:13},
+        {label:'NOTES',w:0},
+      ];
+      logCols[5].w=(PW-2*MX)-logCols.slice(0,5).reduce((s,c)=>s+c.w,0);
+
+      const truncateToWidth=(text,maxWidth)=>{
+        if(!text) return '';
+        if(doc.getTextWidth(text)<=maxWidth) return text;
+        let t=text;
+        while(t.length>0 && doc.getTextWidth(t+'…')>maxWidth) t=t.slice(0,-1);
+        return t+'…';
+      };
+      const drawLogHead=()=>{
+        doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...C.text3);
+        let x=MX;
+        for(const c of logCols){ doc.text(c.label, x, y); x+=c.w; }
+        y+=2.5;
+        doc.setDrawColor(...C.border); doc.setLineWidth(0.2);
+        doc.line(MX,y,PW-MX,y);
+        y+=4.5;
+      };
+      drawLogHead();
+
+      const sortedReadings=[...readings].sort((a,b)=>b.timestamp-a.timestamp);
+      sortedReadings.forEach((r,i)=>{
+        checkBreak(5, drawLogHead);
+        if(i%2===1){ doc.setFillColor(248,247,244); doc.rect(MX,y-3.3,PW-2*MX,4.6,'F'); }
+        let x=MX;
+        doc.setFont('helvetica','normal'); doc.setFontSize(8);
+        doc.setTextColor(...C.text2);
+        doc.text(new Date(r.timestamp).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}), x, y); x+=logCols[0].w;
+        doc.text(new Date(r.timestamp).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}), x, y); x+=logCols[1].w;
+        doc.setTextColor(...C.sys); doc.text(r.systolic!=null?String(r.systolic):'—', x, y); x+=logCols[2].w;
+        doc.setTextColor(...C.dia); doc.text(r.diastolic!=null?String(r.diastolic):'—', x, y); x+=logCols[3].w;
+        doc.setTextColor(...C.bpm); doc.text(r.bpm!=null?String(r.bpm):'—', x, y); x+=logCols[4].w;
+        if(r.notes){
+          doc.setTextColor(...C.text2);
+          doc.text(truncateToWidth(r.notes, logCols[5].w-2), x, y);
+        }
+        y+=4.6;
+      });
+      y+=6;
+    }
 
     // Medications
     if(eventReports.length){
@@ -1455,7 +1515,9 @@ const App = (() => {
       doc.text(`Page ${i} of ${pageCount}`, PW-MX, PH-8, {align:'right'});
     }
 
-    const fname=`bp-report-${new Date(start).toISOString().slice(0,10)}_to_${new Date(end).toISOString().slice(0,10)}.pdf`;
+    const fname = start==null
+      ? `bp-report-all-time_to_${new Date(end).toISOString().slice(0,10)}.pdf`
+      : `bp-report-${new Date(start).toISOString().slice(0,10)}_to_${new Date(end).toISOString().slice(0,10)}.pdf`;
     doc.save(fname);
   }
 
